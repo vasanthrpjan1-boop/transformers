@@ -114,6 +114,10 @@ class RequestState:
         streaming (bool): Whether to stream tokens as they're generated
         created_time (float): The time the request was created.
         error (Optional[str]): Any error message associated with the request. When None, has had no error yet.
+        input_features (torch.Tensor | None): Audio mel spectrogram features for audio models. Shape is typically
+            (1, feature_size, seq_len). Only used during prefill and cleared after first forward pass.
+        feature_attention_mask (torch.Tensor | None): Attention mask for audio features. Used to handle
+            variable-length audio inputs in a batch.
     """
 
     # Required fields
@@ -135,6 +139,9 @@ class RequestState:
     error: str | None = None  # Error message if the request failed
     lifespan: tuple[float, float] = (-1, -1)  # (time request was no longer pending, time request finished)
     _timestamps: list[float] = field(default_factory=list)  # Timestamps of the generated tokens
+    # Audio model support - these features are only used during prefill and cleared after first forward pass
+    input_features: torch.Tensor | None = None  # Audio mel spectrogram features (batch, feature_size, seq_len)
+    feature_attention_mask: torch.Tensor | None = None  # Attention mask for audio features
 
     @property
     def status(self) -> RequestStatus:
@@ -169,6 +176,15 @@ class RequestState:
     def generated_len(self) -> int:
         """Get the number of tokens generated so far."""
         return len(self.generated_tokens)
+
+    def has_audio_features(self) -> bool:
+        """Check if this request has audio features to process."""
+        return self.input_features is not None
+
+    def clear_audio_features(self) -> None:
+        """Clear audio features after prefill to free memory. Audio is only needed during the first forward pass."""
+        self.input_features = None
+        self.feature_attention_mask = None
 
     # TODO: this logic seems one token off, check it out
     @traced
@@ -213,6 +229,7 @@ class RequestState:
             f"full_prompt_length={len(self.initial_tokens)}",
             f"allocated_blocks={self.allocated_blocks}",
             f"generated_tokens={self.generated_tokens}",
+            f"has_audio_features={self.has_audio_features()}",
         ]
         return "RequestState(\n\t" + ",\n\t".join(msg) + "\n)"
 

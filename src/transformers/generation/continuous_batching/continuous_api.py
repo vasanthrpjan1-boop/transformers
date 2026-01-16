@@ -292,6 +292,11 @@ class ContinuousBatchProcessor:
         ]
         # For read index, the +T is because there are -1 for seqlen_q when model uses a sliding window
 
+        # Audio model support - these are set dynamically per batch during prepare_next_batch
+        # Audio features are only used during prefill, not during decoding
+        self.current_batch_input_features: torch.Tensor | None = None
+        self.current_batch_feature_attention_mask: torch.Tensor | None = None
+
         # After allocating empty tensors, we reset them to the right value
         self.reset_static_tensors(full_reset=True)
 
@@ -325,7 +330,11 @@ class ContinuousBatchProcessor:
             self.write_index_storage[i][:q_len].fill_(-2)  # -1 is used to let the cache where new states go
             self.read_index_storage[i][: q_len + k_len].fill_(-2)  # same
 
-    def get_model_kwargs(self, padded_q_size: int = 0, padded_kv_cache_size: int = 0) -> PagedAttentionArgs:
+        # Reset audio features for the batch
+        self.current_batch_input_features = None
+        self.current_batch_feature_attention_mask = None
+
+    def get_model_kwargs(self, padded_q_size: int = 0, padded_kv_cache_size: int = 0) -> dict:
         """Get model keyword arguments for the current batch, eventually padding the query dimension to (padded_q_size)
         and the keys/values dimension to (padded_kv_cache_size). The padding is only useful if we want static shapes,
         like when using cuda graphs AND only activated if both Q and KV are padded."""
@@ -386,6 +395,13 @@ class ContinuousBatchProcessor:
 
         if self.attention_mask is None:
             kwargs["attention_mask"] = None
+
+        # Add audio features if present (only during prefill for audio models)
+        if self.current_batch_input_features is not None:
+            kwargs["input_features"] = self.current_batch_input_features
+            if self.current_batch_feature_attention_mask is not None:
+                kwargs["feature_attention_mask"] = self.current_batch_feature_attention_mask
+
         return kwargs
 
     def __repr__(self) -> str:
@@ -495,6 +511,10 @@ class ContinuousBatchProcessor:
             self.cache.extend_read_indices(state.request_id, past_length, query_length, read_index)
             self.cache.extend_write_indices(state.request_id, past_length, query_length, write_index)
 
+        # Collect audio features for requests that have them (only during prefill)
+        # Audio features are only processed once during the first forward pass
+        self._collect_audio_features_for_batch()
+
         # When looping over request is done, we can build the actual tensors
         self._build_tensors(
             input_ids,
@@ -515,6 +535,40 @@ class ContinuousBatchProcessor:
                 f"cum KV: {ck}, free blocks: {self.cache.get_num_free_blocks()}"
             )
         return True
+
+    @traced
+    def _collect_audio_features_for_batch(self) -> None:
+        """Collect and batch audio features from requests that have them.
+
+        Audio features are only used during the first forward pass (prefill) and are cleared
+        from requests after collection to free memory. This enables continuous batching for
+        audio models like Qwen2Audio, Voxtral, and Gemma3n.
+        """
+        input_features_list = []
+        feature_attention_mask_list = []
+
+        for state in self.requests_in_batch:
+            # Only collect audio features for requests that have them and are in prefill
+            # Audio is only needed on the first forward pass (position_offset was just updated)
+            if state.has_audio_features():
+                input_features_list.append(state.input_features)
+                if state.feature_attention_mask is not None:
+                    feature_attention_mask_list.append(state.feature_attention_mask)
+                # Clear audio features after collection to free memory
+                # They won't be needed after the first forward pass
+                state.clear_audio_features()
+
+        # Batch the audio features if any requests have them
+        if input_features_list:
+            # Concatenate along batch dimension
+            self.current_batch_input_features = torch.cat(input_features_list, dim=0)
+            if feature_attention_mask_list:
+                self.current_batch_feature_attention_mask = torch.cat(feature_attention_mask_list, dim=0)
+            else:
+                self.current_batch_feature_attention_mask = None
+        else:
+            self.current_batch_input_features = None
+            self.current_batch_feature_attention_mask = None
 
     @traced
     def _build_tensors(
@@ -909,13 +963,21 @@ class ContinuousBatchingManager:
         max_new_tokens: int | None = None,
         streaming: bool = False,
         record_timestamps: bool = False,
+        input_features: torch.Tensor | None = None,
+        feature_attention_mask: torch.Tensor | None = None,
     ) -> str:
         """Add a new generation request to the queue.
 
         Args:
             input_ids: Input token IDs to use as prompt
             request_id: Optional custom request ID (auto-generated if None)
-            **kwargs: Additional generation parameters
+            max_new_tokens: Maximum number of new tokens to generate
+            streaming: Whether to stream tokens as they're generated
+            record_timestamps: Whether to record timestamps for generated tokens
+            input_features: Audio mel spectrogram features for audio models. Shape is typically
+                (1, feature_size, seq_len). Only used during prefill.
+            feature_attention_mask: Attention mask for audio features. Used to handle
+                variable-length audio inputs.
 
         Returns:
             str: The request ID
@@ -936,6 +998,8 @@ class ContinuousBatchingManager:
             max_new_tokens=max_new_tokens,
             eos_token_id=self.generation_config.eos_token_id,
             streaming=streaming,
+            input_features=input_features,
+            feature_attention_mask=feature_attention_mask,
         )
 
         # Use block=True with timeout to handle backpressure if queue is full
@@ -948,10 +1012,31 @@ class ContinuousBatchingManager:
         max_new_tokens: int | None = None,
         streaming: bool = False,
         record_timestamps: bool = False,
+        input_features: list[torch.Tensor] | None = None,
+        feature_attention_mask: list[torch.Tensor] | None = None,
     ) -> None:
-        for input_ids in inputs:
+        """Add multiple generation requests to the queue.
+
+        Args:
+            inputs: List of input token ID sequences to use as prompts
+            max_new_tokens: Maximum number of new tokens to generate per request
+            streaming: Whether to stream tokens as they're generated
+            record_timestamps: Whether to record timestamps for generated tokens
+            input_features: List of audio mel spectrogram features for audio models. Each tensor
+                should have shape (1, feature_size, seq_len). Only used during prefill.
+            feature_attention_mask: List of attention masks for audio features. Used to handle
+                variable-length audio inputs.
+        """
+        for i, input_ids in enumerate(inputs):
+            features = input_features[i] if input_features is not None else None
+            mask = feature_attention_mask[i] if feature_attention_mask is not None else None
             self.add_request(
-                input_ids, max_new_tokens=max_new_tokens, streaming=streaming, record_timestamps=record_timestamps
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                streaming=streaming,
+                record_timestamps=record_timestamps,
+                input_features=features,
+                feature_attention_mask=mask,
             )
 
     def cancel_request(self, request_id: str) -> None:
@@ -1202,6 +1287,8 @@ class ContinuousMixin:
         allow_prefix_sharing: bool = True,
         record_timestamps: bool = False,
         progress_bar: bool = True,
+        input_features: list[torch.Tensor] | None = None,
+        feature_attention_mask: list[torch.Tensor] | None = None,
         **kwargs,
     ) -> dict[str, GenerationOutput]:
         """Generate sequences for a batch of prompts using continuous batching.
@@ -1214,6 +1301,11 @@ class ContinuousMixin:
             allow_prefix_sharing: A flag to allow prefix sharing if the model has only full attention layers
             record_timestamps: If set to true, the requests will have a timestamp for each token generated
             progress_bar: If set to true, a progress bar will be displayed
+            input_features: List of audio mel spectrogram features for audio models. Each tensor
+                should have shape (1, feature_size, seq_len). Only used during prefill for models
+                like Qwen2Audio, Voxtral, and Gemma3n.
+            feature_attention_mask: List of attention masks for audio features. Used to handle
+                variable-length audio inputs in a batch.
             **kwargs: Additional generation parameters
 
         Returns:
@@ -1246,7 +1338,12 @@ class ContinuousMixin:
             ) as pbar,
         ):
             try:
-                manager.add_requests(inputs=inputs, max_new_tokens=kwargs.get("max_new_tokens"))
+                manager.add_requests(
+                    inputs=inputs,
+                    max_new_tokens=kwargs.get("max_new_tokens"),
+                    input_features=input_features,
+                    feature_attention_mask=feature_attention_mask,
+                )
                 finished_count = 0
                 while finished_count < num_requests:
                     result = manager.get_result(timeout=1)
